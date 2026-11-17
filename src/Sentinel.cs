@@ -53,7 +53,8 @@ namespace Transfer
     }
 
     /// <summary>
-    /// Sentinel — собственный антивирус (C:\Program Files\Sentinel\Sentinel.Cli.exe, исходники — репозиторий Antivirus-tool).
+    /// Sentinel — собственный антивирус (исходники — репозиторий Antivirus-tool). Встроен в Перенос.exe (src/sentinel/sentinel.zip);
+    /// если в сборке его нет — берётся установленный C:\Program Files\Sentinel\Sentinel.Cli.exe или tools\Sentinel на диске переноса.
     /// Заменил Kaspersky Virus Removal Tool: ничего не скачивает из интернета, не перезапускает себя из %TEMP%
     /// и проверяет только те места клона, где живут программы и данные (системные файлы Windows сверяет sfc на следующем этапе).
     ///
@@ -79,10 +80,75 @@ namespace Transfer
         // Места внутри Windows, где прячутся вирусы. Остальное — системные файлы, их сверяет sfc с оригиналами Microsoft.
         static readonly string[] WindowsParts = { "Temp", "Tasks", "Setup", @"System32\Tasks", @"System32\drivers", @"System32\GroupPolicy", @"SysWOW64\GroupPolicy", @"System32\spool\drivers" };
 
-        /// <summary>Где взять Sentinel: установленный (Program Files), затем копия в папке tools на диске переноса.</summary>
+        public const string ResourceName = "Transfer.sentinel.zip";
+
+        /// <summary>
+        /// Дополнительные параметры запуска: если Sentinel на компьютере не установлен, его служебные данные (настройки, кэш)
+        /// живут в %LOCALAPPDATA%\Perenos\sentinel-data, а не в ProgramData чужого компьютера. Если установлен — берутся его данные
+        /// (там обновлённая база угроз и белый список пользователя).
+        /// </summary>
+        public static string ExtraArgs = "";
+
+        static string LocalBase { get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Perenos"); } }
+
+        /// <summary>
+        /// Sentinel, встроенный в Перенос.exe (ресурс Transfer.sentinel.zip, собирается scripts/update-sentinel.sh): распаковывается
+        /// один раз в %LOCALAPPDATA%\Perenos\sentinel\&lt;отпечаток&gt;\. null — в этой сборке Sentinel не встроен или распаковать не удалось.
+        /// </summary>
+        static string Embedded(out string version)
+        {
+            version = "";
+            try
+            {
+                using (var s = typeof(SentinelScan).Assembly.GetManifestResourceStream(ResourceName))
+                {
+                    if (s == null) { Log.Write("sentinel: в эту сборку Sentinel не встроен"); return null; }
+                    string id;
+                    using (var sha = System.Security.Cryptography.SHA1.Create()) id = BitConverter.ToString(sha.ComputeHash(s)).Replace("-", "").Substring(0, 12).ToLowerInvariant();
+                    s.Position = 0;
+                    string baseDir = Path.Combine(LocalBase, "sentinel"), dir = Path.Combine(baseDir, id), exe = Path.Combine(dir, ExeName), ok = Path.Combine(dir, ".ok");
+                    if (!File.Exists(ok) || !File.Exists(exe))
+                    {
+                        Directory.CreateDirectory(baseDir);
+                        // старые распакованные версии больше не нужны
+                        foreach (var d in Directory.GetDirectories(baseDir)) { try { Directory.Delete(d, true); } catch { } }
+                        string tmp = dir + ".part";
+                        Directory.CreateDirectory(tmp);
+                        string full = Path.GetFullPath(tmp).TrimEnd('\\') + "\\";
+                        using (var zip = new System.IO.Compression.ZipArchive(s, System.IO.Compression.ZipArchiveMode.Read))
+                            foreach (var e in zip.Entries)
+                            {
+                                if (string.IsNullOrEmpty(e.Name)) continue;          // папка
+                                string dst = Path.GetFullPath(Path.Combine(tmp, e.FullName.Replace('/', '\\')));
+                                if (!dst.StartsWith(full, StringComparison.OrdinalIgnoreCase)) continue;    // путь вне папки — не распаковываем
+                                Directory.CreateDirectory(Path.GetDirectoryName(dst));
+                                System.IO.Compression.ZipFileExtensions.ExtractToFile(e, dst, true);
+                            }
+                        if (Directory.Exists(dir)) Directory.Delete(dir, true);
+                        Directory.Move(tmp, dir);
+                        File.WriteAllText(ok, DateTime.Now.ToString("s"));
+                        Log.Write("sentinel: встроенный Sentinel распакован в " + dir);
+                    }
+                    try { version = File.ReadAllText(Path.Combine(dir, "sentinel-version.txt")).Trim(); } catch { }
+                    var m = Regex.Match(version, @"Sentinel\s+([\d\.]+)"); if (m.Success) version = m.Groups[1].Value;
+                    return File.Exists(exe) ? exe : null;
+                }
+            }
+            catch (Exception e) { Log.Write("sentinel: не удалось распаковать встроенный Sentinel — " + e.Message); return null; }
+        }
+
+        /// <summary>
+        /// Где взять Sentinel: встроенный в программу (основной путь — ничего не нужно ставить и скачивать),
+        /// затем установленный (Program Files), затем копия в папке tools на диске переноса.
+        /// </summary>
         public static string Find(string root, out string version, out string note)
         {
             version = ""; note = "";
+            string pd = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "Sentinel");
+            string own = Path.Combine(LocalBase, "sentinel-data");
+            ExtraArgs = Directory.Exists(pd) ? "" : " --data-dir " + Sh.Quote(own);
+            string emb = Embedded(out version);
+            if (emb != null) { Log.Write("sentinel: встроенный " + version + (ExtraArgs != "" ? ", данные в " + own : ", данные установленного Sentinel")); return emb; }
             var cands = new List<string>();
             foreach (var pf in new[] { Environment.GetEnvironmentVariable("ProgramW6432"), Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), Environment.GetEnvironmentVariable("ProgramFiles") })
                 if (!string.IsNullOrEmpty(pf)) cands.Add(Path.Combine(pf, "Sentinel", ExeName));
@@ -111,7 +177,7 @@ namespace Transfer
                 }
                 catch (Exception e) { Log.Write("sentinel: " + c + " — " + e.Message); }
             }
-            note = "Sentinel не установлен (нет " + Path.Combine("C:\\Program Files\\Sentinel", ExeName) + " и папки tools\\Sentinel на диске переноса)";
+            note = "Sentinel не встроен в эту сборку программы и не установлен на компьютере";
             return null;
         }
 
@@ -175,7 +241,7 @@ namespace Transfer
                 string dir = targets[i].Key; bool recurse = targets[i].Value;
                 string name = (i + 1).ToString("00") + "-" + Safe(recurse ? Path.GetFileName(dir.TrimEnd('\\')) : "root");
                 string json = Path.Combine(reportDir, name + ".json"), html = Path.Combine(reportDir, name + ".html");
-                string args = "scan " + Sh.Quote(dir) + (recurse ? "" : " --no-recurse") + " --report-json " + Sh.Quote(json) + " --report-html " + Sh.Quote(html);
+                string args = "scan " + Sh.Quote(dir) + (recurse ? "" : " --no-recurse") + " --report-json " + Sh.Quote(json) + " --report-html " + Sh.Quote(html) + ExtraArgs;
                 status("Sentinel проверяет " + Fmt.ShortPath(dir, 80));
                 var text = new List<SentinelFinding>(); SentinelFinding cur = null; var errs = new List<string>();
                 var started = DateTime.Now;
@@ -251,7 +317,7 @@ namespace Transfer
                 string json = Path.Combine(reportDir, verb + ".json"), html = Path.Combine(reportDir, verb + ".html");
                 status("Sentinel: " + (verb == "audit-startup" ? "автозагрузка и закрепление в системе" : verb == "audit-config" ? "настройки защиты Windows" : verb));
                 string first = "";
-                int rc = Sh.Run(exe, verb + " --report-json " + Sh.Quote(json) + " --report-html " + Sh.Quote(html), l => { if (first == "" && l.Trim() != "") first = l.Trim(); }, Encoding.UTF8, null, stop);
+                int rc = Sh.Run(exe, verb + " --report-json " + Sh.Quote(json) + " --report-html " + Sh.Quote(html) + ExtraArgs, l => { if (first == "" && l.Trim() != "") first = l.Trim(); }, Encoding.UTF8, null, stop);
                 Log.Write("sentinel " + verb + " -> код " + rc);
                 if (stop()) break;
                 if (rc == 0 || rc == 1)

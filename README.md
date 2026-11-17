@@ -19,6 +19,20 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\MSBuild.exe src\Transfer.csproj 
 ```
 
 Готовый `src\bin\Transfer.exe` кладётся на диск переноса как `F:\Windows Transfer\Перенос.exe`.
+Антивирус Sentinel встраивается в него автоматически из `src\sentinel\sentinel.zip` (exe получается ≈ 31 МБ).
+
+### Обновить встроенный Sentinel
+
+`src\sentinel\sentinel.zip` — готовая сборка Sentinel для Windows x64 (автономная, .NET на компьютере не нужен):
+`Sentinel.Cli.exe`, `rules\`, `data\threat_hashes.bin`, `allowed_exclusions.json`, `THIRD_PARTY_NOTICES.md`, `sentinel-version.txt`.
+Её пересобирает скрипт (нужны .NET SDK 8 и git; работает на Linux, macOS и Windows с bash):
+
+```
+scripts/update-sentinel.sh            # из ветки main репозитория Antivirus-tool
+scripts/update-sentinel.sh <коммит>   # из конкретной версии
+```
+
+После этого — обычная сборка MSBuild. Если архива нет, программа всё равно собирается и ищет установленный Sentinel.
 
 ### Ограничения кода
 
@@ -41,7 +55,8 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\MSBuild.exe src\Transfer.csproj 
 | `Clone.cs` | `CloneFlowBase` (DISM с процентами, коды ошибок, повтор при обрыве диска, `AddDrivers`, проверки), `CloneCaptureFlow`, `CloneApplyFlow`, `CloneFinishFlow` |
 | `Images.cs` | Список Windows/клонов/шаблонов, `TemplateImportFlow` (копирование шаблона с докачкой) |
 | `Security.cs` | Собственная проверка: Защитник (MpCmdRun), исключения Защитника, автозапуск, задачи, службы, брандмауэр, майнеры в файлах |
-| `Sentinel.cs` | `SentinelScan` — запуск и разбор Sentinel; `Quarantine` — карантин на диске переноса |
+| `Sentinel.cs` | `SentinelScan` — распаковка встроенного Sentinel, запуск и разбор отчётов; `Quarantine` — карантин на диске переноса |
+| `sentinel/sentinel.zip` | Встроенный антивирус Sentinel (собирается `scripts/update-sentinel.sh`) |
 | `Hardware.cs` | Профиль железа, контроллер диска (VMD/RST), совместимость |
 | `Errors.cs` | Разбор ошибок robocopy, `Problem`, текстовые отчёты |
 | `Util.cs` | `Sh.Run` (запуск утилит, остановка и пауза **всего дерева процессов**), `Native` (P/Invoke), `Fmt`, `Log`, `Json` |
@@ -80,8 +95,12 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\MSBuild.exe src\Transfer.csproj 
 (15+ минут на 100 ГБ) и перезапускал себя копией из `%TEMP%`. Теперь используется **Sentinel** — собственный антивирус
 пользователя (репозиторий `masterRaizer/Antivirus-tool`, версия 1.3.x).
 
-- **Где берётся**: `C:\Program Files\Sentinel\Sentinel.Cli.exe`, затем `tools\Sentinel\Sentinel.Cli.exe` на диске переноса.
-  Если его нет, этап помечается жёлтым с понятным текстом, перенос продолжается.
+- **Где берётся**: Sentinel **встроен в Перенос.exe** (ресурс `Transfer.sentinel.zip`). При первой проверке он распаковывается в
+  `%LOCALAPPDATA%\Perenos\sentinel\<отпечаток>\` (старые версии удаляются) — ничего скачивать и устанавливать не нужно.
+  Если на компьютере уже установлен Sentinel (`%ProgramData%\Sentinel` есть), встроенный использует его данные — обновлённую базу угроз
+  и белый список; если нет — свои данные в `%LOCALAPPDATA%\Perenos\sentinel-data` (`--data-dir`), чтобы не оставлять следов в ProgramData.
+  Запасные пути, если сборка без архива: `C:\Program Files\Sentinel\Sentinel.Cli.exe`, затем `tools\Sentinel\Sentinel.Cli.exe` на диске переноса.
+  Если Sentinel не нашёлся нигде, этап помечается жёлтым с понятным текстом, перенос продолжается.
 - **Что проверяется**: файлы в корне клона, все папки верхнего уровня (кроме `Windows`, `Windows.old`, `System Volume Information`,
   `Recovery` и служебных `$…`), а внутри `Windows` — `Temp`, `Tasks`, `Setup`, `System32\Tasks`, `System32\drivers`,
   `System32\GroupPolicy`, `SysWOW64\GroupPolicy`, `System32\spool\drivers`. Остальные системные файлы сверяет с оригиналами `sfc`.
@@ -117,5 +136,5 @@ data\xfer.id            метка диска (диск находится и п
 images\<ПК>-C-<дата>\windows.wim + clone.json
 images\drivers-<ПК>\    драйверы компьютера, на который разворачивается клон
 templates\*.wim|*.esd   шаблоны Windows
-tools\Sentinel\         (необязательно) переносная копия Sentinel
+tools\Sentinel\         (не нужно: Sentinel встроен в программу) запасная копия Sentinel
 ```
