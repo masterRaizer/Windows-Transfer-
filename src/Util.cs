@@ -170,6 +170,13 @@ namespace Transfer
             foreach (var p in list) Native.SuspendTree(p, pause);
         }
 
+        /// <summary>Завершить все долгие утилиты вместе с их дочерними процессами (отмена, закрытие окна во время работы).</summary>
+        public static void KillAll()
+        {
+            Process[] list; lock (Active) list = Active.ToArray();
+            foreach (var p in list) Native.KillTree(p);
+        }
+
         /// <summary>
         /// Запуск программы без окна с построчным чтением вывода. stop — когда вернёт true, программа завершается вместе
         /// со всеми процессами, которые она запустила (отмена, «Пропустить проверку»). Возвращает код выхода.

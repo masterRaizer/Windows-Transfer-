@@ -113,6 +113,9 @@ namespace Transfer
             if (Paused) { Paused = false; Sh.SetPaused(false); }
             if (OnCancel != null) { try { OnCancel(); } catch { } }
             KillCurrent();
+            // Sentinel, sfc, Защитник останавливаются и сами (через stop в Sh.Run), но при закрытии окна поток переноса
+            // обрывается раньше — поэтому долгие утилиты гасим сразу, чтобы они не остались работать без программы.
+            Sh.KillAll();
         }
 
         void KillCurrent()
