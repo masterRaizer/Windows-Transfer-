@@ -570,7 +570,10 @@ namespace Transfer
                 if (sf < 0) { Indet(true); pct = ""; Task.ProgressState = TaskbarItemProgressState.Indeterminate; }
                 else { Indet(false); RunBar.Value = sf; pct = ((int)Math.Floor(sf * 100)) + "%"; Task.ProgressState = TaskbarItemProgressState.Normal; Task.ProgressValue = sf; }
                 RunStat.Text = flow.StageStat;
-                TileDone.Text = "—"; TileDoneSub.Text = ""; TileSpeed.Text = "—"; TileFiles.Text = ""; TileEta.Text = "—"; TileEtaSub.Text = "";
+                double seta = flow.StageEta; bool hasEta = !double.IsNaN(seta) && !double.IsInfinity(seta) && sf >= 0;
+                TileDone.Text = "—"; TileDoneSub.Text = ""; TileSpeed.Text = "—"; TileFiles.Text = "";
+                TileEta.Text = r.Paused ? "на паузе" : hasEta ? Fmt.Eta(seta) : "—";
+                TileEtaSub.Text = (!r.Paused && hasEta && seta > 60) ? "закончится около " + DateTime.Now.AddSeconds(seta).ToString("HH:mm") : "";
                 NowJob.Text = flow.Activity; NowCount.Text = ""; NowFile.Text = Fmt.ShortPath(Pretty(flow.ActivityDetail), 92);
             }
             RunPercent.Text = pct; RunPercent.Visibility = pct == "" ? Visibility.Collapsed : Visibility.Visible;

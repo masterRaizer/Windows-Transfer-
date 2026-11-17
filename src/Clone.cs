@@ -119,6 +119,15 @@ namespace Transfer
         // ---------------------------------------------------------------------------------------- проверка на вирусы
         protected SecurityReport Sec;
         protected string SecReportPath = "";
+        /// <summary>Находки других проверок (Sentinel), которые попадут в общий отчёт проверки на вирусы.</summary>
+        protected readonly List<Threat> ExtraThreats = new List<Threat>();
+        protected bool SentinelUsed;
+
+        /// <summary>Функция «остановиться?» для проверок: ждёт, пока снята пауза; true — отмена (или «Пропустить», если этап можно пропустить).</summary>
+        protected Func<bool> StopCheck(bool skippable)
+        {
+            return () => { R.WaitWhilePaused(); return R.Cancelled || (skippable && R.SkipRequested); };
+        }
 
         /// <summary>Вопрос «да/нет» поверх окна программы; по умолчанию — «Нет».</summary>
         protected bool Ask(string title, string text)
@@ -140,8 +149,10 @@ namespace Transfer
         protected void RunSecurityScan(string stepId, string root, bool live, string reportTitle, bool skippable = false)
         {
             Set(stepId, "run"); StageFraction = -1; StageStat = "";
-            Sec = Security.Scan(root, live, s => ActivityDetail = s, () => R.Cancelled || (skippable && R.SkipRequested));
+            Sec = Security.Scan(root, live, s => ActivityDetail = s, StopCheck(skippable));
             if (skippable && R.SkipRequested) return;   // неполный результат — отчёт и проблемы не пишем
+            foreach (var t in ExtraThreats)
+                if (!Sec.Items.Any(x => x.What == t.What && string.Equals(x.Path, t.Path, StringComparison.OrdinalIgnoreCase))) Sec.Items.Add(t);
             string text = Sec.ToText(reportTitle);
             foreach (var dir in new[] { CloneDir, Logs })
                 try { Directory.CreateDirectory(dir); string p = Path.Combine(dir, "security-" + Stamp + ".txt"); File.WriteAllText(p, text, new UTF8Encoding(true)); if (SecReportPath == "") SecReportPath = p; } catch { }
@@ -165,28 +176,151 @@ namespace Transfer
             return string.Join("\n", top) + (more > 0 ? "\n…и ещё " + more : "");
         }
 
-        /// <summary>Удалить из развёрнутой копии файлы, найденные проверкой (только внутри root). Возвращает, сколько удалено.</summary>
+        /// <summary>
+        /// Убрать из развёрнутой копии файлы, найденные проверкой (только внутри root): они переносятся в карантин на диске переноса,
+        /// а не удаляются — при ложном срабатывании файл можно вернуть (см. data\quarantine\…\manifest.txt). Возвращает, сколько убрано.
+        /// </summary>
         protected int Disarm(string root)
         {
             int n = 0; string r = root.TrimEnd('\\') + "\\";
-            var files = Sec.Items.Where(t => t.Level >= 2 && t.File != "").Select(t => t.File).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
-            foreach (var f in files)
+            string qdir = Quarantine.Dir(Root, Stamp);
+            var items = Sec.Items.Where(t => t.Level >= 2 && t.File != "").GroupBy(t => t.File, StringComparer.OrdinalIgnoreCase).Select(g => g.First()).ToList();
+            foreach (var t in items)
             {
+                string f = t.File;
                 if (!f.StartsWith(r, StringComparison.OrdinalIgnoreCase)) continue;
                 try
                 {
                     if (!File.Exists(f)) continue;
-                    File.SetAttributes(f, FileAttributes.Normal); File.Delete(f); n++;
-                    Log.Write("обезврежено в клоне: удалён " + f);
-                    // папка майнера в ProgramData, где кроме него ничего нет, — тоже лишняя
+                    if (Quarantine.Put(qdir, r, f, "проверка программы: " + t.What) == null) continue;
+                    n++;
+                    // папка майнера в ProgramData, где кроме него ничего исполняемого нет, — тоже лишняя (там его настройки и журналы)
                     string d = Path.GetDirectoryName(f);
                     if (d.StartsWith(Path.Combine(r, "ProgramData") + "\\", StringComparison.OrdinalIgnoreCase) && Directory.Exists(d) &&
                         !Directory.EnumerateFiles(d, "*.exe", SearchOption.AllDirectories).Any())
                     { Directory.Delete(d, true); Log.Write("обезврежено в клоне: удалена папка " + d); }
                 }
-                catch (Exception e) { Log.Write("не удалось удалить " + f + ": " + e.Message); }
+                catch (Exception e) { Log.Write("не удалось убрать " + f + ": " + e.Message); }
             }
             return n;
+        }
+
+        /// <summary>
+        /// Проверка развёрнутого клона антивирусом Sentinel. Определённые угрозы (сигнатура, база хешей, облако) уходят в карантин на диске переноса,
+        /// находки одной эвристики только попадают в отчёт. false — в клоне остались угрозы, которые убрать не удалось (вызван Fail).
+        /// </summary>
+        protected bool SentinelClone(string stepId, string target)
+        {
+            Set(stepId, "run"); Activity = "Sentinel ищет вирусы в клоне"; ActivityDetail = "до первого запуска клона"; ResetStage();
+            R.SkipRequested = false; R.SkipLabel = "Пропустить проверку";
+            try
+            {
+                string ver, note;
+                string exe = SentinelScan.Find(Root, out ver, out note);
+                if (exe == null)
+                {
+                    Set(stepId, "warn", note + " — клон проверит только сама программа");
+                    Summary.Add("Sentinel: не запускался — " + note + ". Клон проверен только встроенными правилами программы.");
+                    return true;
+                }
+                var stop = StopCheck(true);
+                var targets = SentinelScan.Targets(target);
+                long total = -1; var started = DateTime.Now;
+                var counter = new Thread(() =>
+                {
+                    long t = 0;
+                    foreach (var kv in targets) { long c = SentinelScan.CountFiles(kv.Key, kv.Value, stop); if (c < 0) return; t += c; }
+                    Interlocked.Exchange(ref total, Math.Max(1, t));
+                    Log.Write("sentinel: к проверке файлов " + t + " в " + targets.Count + " местах клона");
+                }) { IsBackground = true };
+                counter.Start();
+                var clock = new StageClock(R); DateTime next = DateTime.MinValue;
+                string reportDir = Path.Combine(Logs, "sentinel-" + Stamp);
+                var res = SentinelScan.ScanClone(exe, targets, reportDir, (path, n, found) =>
+                {
+                    if (DateTime.Now < next) return;
+                    next = DateTime.Now.AddMilliseconds(250);
+                    long tot = Interlocked.Read(ref total);
+                    string f = found > 0 ? " · найдено " + found : "";
+                    if (tot > 0)
+                    {
+                        double fr = Math.Min(0.999, (double)n / tot);
+                        StageFraction = fr; StageEta = clock.Update(fr);
+                        StageStat = "проверено " + n.ToString("N0") + " из " + tot.ToString("N0") + " файлов" + f;
+                    }
+                    else StageStat = "проверено " + n.ToString("N0") + " файлов" + f + " · считаю, сколько всего";
+                    ActivityDetail = path;
+                }, st => { Activity = st; }, stop);
+                Activity = "Sentinel ищет вирусы в клоне";
+                ResetStage();
+                if (R.Cancelled) return true;
+                if (R.SkipRequested) { SkipNote(stepId, "Sentinel"); return true; }
+                string took = Fmt.Clock(DateTime.Now - started);
+                if (!res.Ran)
+                {
+                    Set(stepId, "warn", "проверка не выполнена: " + res.Note);
+                    Summary.Add("Sentinel: проверка не выполнена — " + res.Note + ". Журнал: " + Log.FilePath);
+                    return true;
+                }
+                SentinelUsed = true;
+                string r = target.TrimEnd('\\') + "\\";
+                var bad = res.Findings.Where(x => x.Isolate && x.Path.StartsWith(r, StringComparison.OrdinalIgnoreCase)).ToList();
+                var other = res.Findings.Where(x => !bad.Contains(x) && x.Severity >= 1).ToList();
+                string qdir = Quarantine.Dir(Root, Stamp); int moved = 0; var left = new List<SentinelFinding>();
+                if (bad.Count > 0) { Activity = "Убираю найденное из клона в карантин"; ActivityDetail = qdir; }
+                foreach (var x in bad)
+                {
+                    if (Quarantine.Put(qdir, r, x.Path, "Sentinel: " + x.Rule) != null) moved++;
+                    else if (File.Exists(x.Path)) left.Add(x);
+                }
+                string html = res.HtmlReports.Count > 0 ? res.HtmlReports[0] : "";
+                if (bad.Count > 0)
+                {
+                    var p = new Problem { Key = "sentinel", Title = "Sentinel нашёл вирусы в клоне", Severity = 2, Count = bad.Count,
+                        Explain = "Найденное убрано из клона в карантин на диске переноса до первого запуска клона.",
+                        Action = "Карантин: " + qdir + " (откуда взят каждый файл — в manifest.txt). Отчёты Sentinel: " + reportDir + ". Компьютер, с которого снимался клон, тоже заражён — проверь его и смени пароли." };
+                    foreach (var x in bad.Take(20)) p.Samples.Add(x.ToString());
+                    Problems.Add(p);
+                }
+                if (other.Count > 0)
+                {
+                    var p = new Problem { Key = "sentinel-suspicious", Title = "Sentinel: подозрительные файлы в клоне", Severity = 1, Count = other.Count,
+                        Explain = "Сработали эвристики (например, неподписанная программа с необычным устройством). Это не обязательно вирус, поэтому файлы оставлены на месте.",
+                        Action = "Посмотри отчёт Sentinel" + (html != "" ? ": " + html : " в папке " + reportDir) + ". Если программа тебе незнакома — удали её в клоне после первого запуска." };
+                    foreach (var x in other.Take(20)) p.Samples.Add(x.ToString());
+                    Problems.Add(p);
+                }
+                Log.Write("sentinel: проверено " + res.Checked + ", угроз " + bad.Count + " (в карантин " + moved + "), подозрительного " + other.Count + ", не прочитано " + res.ReadErrors + ", " + took);
+                if (left.Count > 0)
+                {
+                    Fail("В клоне остались вирусы", "Sentinel нашёл угрозы, но убрать удалось не все: " + string.Join("; ", left.Take(3).Select(x => x.Name + " " + x.Path)) +
+                         ". Загрузчик не записан — клон не запустится. Основная Windows не тронута. Отчёт: " + reportDir);
+                    return false;
+                }
+                string head = "проверено " + Fmt.Count(res.Checked, "файл", "файла", "файлов") + " за " + took;
+                Set(stepId, bad.Count > 0 || other.Count > 0 || res.Note != "" ? "warn" : "ok",
+                    head + (bad.Count > 0 ? " · угроз " + bad.Count + ", убрано в карантин " + moved : " · вирусов не найдено") +
+                    (other.Count > 0 ? " · подозрительного " + other.Count + " (см. отчёт)" : "") + (res.Note != "" ? " · " + res.Note : ""));
+                Summary.Add("Sentinel" + (ver != "" ? " " + ver : "") + ": " + head + (bad.Count > 0 ? ", угроз " + bad.Count + " — убраны в карантин " + qdir : ", вирусов нет") +
+                            (other.Count > 0 ? ", подозрительного " + other.Count : "") + ". Отчёт: " + (html != "" ? html : reportDir));
+                return true;
+            }
+            finally { R.SkipLabel = null; R.SkipRequested = false; ResetStage(); }
+        }
+
+        /// <summary>Быстрый аудит Sentinel для работающей Windows (автозагрузка и настройки защиты): находки попадут в общий отчёт проверки.</summary>
+        protected void SentinelLive()
+        {
+            string ver, note;
+            string exe = SentinelScan.Find(Root, out ver, out note);
+            if (exe == null) { Log.Write("sentinel: " + note); return; }
+            var res = SentinelScan.Audit(exe, new[] { "audit-startup", "audit-config" }, Path.Combine(Logs, "sentinel-" + Stamp), s => ActivityDetail = s, StopCheck(false));
+            if (!res.Ran) { Log.Write("sentinel: аудит не выполнен — " + res.Note); return; }
+            SentinelUsed = true;
+            foreach (var f in res.Findings.Where(x => x.Severity >= 1))
+                ExtraThreats.Add(new Threat { Level = f.Severity >= 3 ? 2 : 1, What = "Sentinel: " + (f.Name != "" ? f.Name : f.Rule), Path = f.Path,
+                    Why = (f.Rule + (f.Description != "" ? " — " + (f.Description.Length > 160 ? f.Description.Substring(0, 160) + "…" : f.Description) : "")).Trim(' ', '—') });
+            Log.Write("sentinel: аудит работающей Windows — находок " + res.Findings.Count + ", отчёты " + res.ReportDir);
         }
     }
 
@@ -258,6 +392,7 @@ namespace Transfer
 
             // ---- проверка на вирусы: заражённую Windows клонировать нельзя — вирус переедет вместе с ней
             Activity = "Проверяю Windows на вирусы и майнеры"; ActivityDetail = "заражённую систему клонировать нельзя — вирус переедет вместе с ней";
+            if (isSystem) { Set("scan", "run"); SentinelLive(); if (R.Cancelled) return; }
             RunSecurityScan("scan", Source, isSystem, "Проверка перед снятием клона: " + Environment.MachineName + ", диск " + Source.Substring(0, 2));
             if (R.Cancelled) return;
             if (Sec.Dangerous > 0)
@@ -273,7 +408,7 @@ namespace Transfer
                 Set("scan", "warn", "найдено опасного: " + Sec.Dangerous + " — клон снят по твоему решению, вирусы будут и в нём");
             }
             else Set("scan", Sec.Suspicious > 0 ? "warn" : "ok", (Sec.Suspicious > 0 ? "опасного нет, подозрительного: " + Sec.Suspicious + " (см. отчёт)" : "вирусов и майнеров не найдено") +
-                                                                (Sec.DefenderUsed ? " · проверили Защитник и программа" : " · Защитник не работает, проверено правилами программы"));
+                                                                " · проверили " + string.Join(", ", new[] { Sec.DefenderUsed ? "Защитник" : null, SentinelUsed ? "Sentinel" : null, "правила программы" }.Where(x => x != null)));
 
             // ---- снимок (для работающей системы)
             string capDir = Source; bool snap = false;
@@ -404,7 +539,7 @@ namespace Transfer
             TrackDevice();
             bool test = TestDir != null;
             AddStep("check", "Проверка"); if (!test) { AddStep("drv", "Драйверы этого компьютера"); AddStep("part", "Раздел под клон"); }
-            AddStep("apply", "Разворачивание Windows"); AddStep("kvrt", "Kaspersky: поиск и лечение вирусов"); AddStep("scan", "Проверка на майнеры и следы вирусов");
+            AddStep("apply", "Разворачивание Windows"); AddStep("sentinel", "Sentinel: поиск вирусов в клоне"); AddStep("scan", "Проверка на майнеры и следы вирусов");
             AddStep("sfc", "Сверка системных файлов"); AddStep("fix", "Драйверы и настройка"); AddStep("boot", "Загрузчик");
             string sys = Environment.GetEnvironmentVariable("SystemDrive") ?? "C:";
 
@@ -418,7 +553,7 @@ namespace Transfer
             }
             // клон, снятый с заражённой Windows, — спросить до того, как что-то менять на этом компьютере
             string secMark = ""; try { if (TemplateRel == null && File.Exists(Meta)) secMark = Json.Str(Json.ReadFile(Meta), "Security") ?? ""; } catch { }
-            if (secMark == "infected") Log.Write("клон помечен как заражённый при снятии — после разворачивания его вылечат Kaspersky и проверка программы");
+            if (secMark == "infected") Log.Write("клон помечен как заражённый при снятии — после разворачивания его проверят Sentinel и правила программы");
             Set("check", "ok", Label + ", " + Fmt.Size(ImageBytes) + (secMark == "infected" ? " · клон был заражён — вылечу после разворачивания" : ""));
 
             string target = TestDir, drivers = Path.Combine(Root, "images", "drivers-" + Environment.MachineName);
@@ -545,36 +680,9 @@ namespace Transfer
             if (!File.Exists(Path.Combine(target, @"Windows\System32\ntoskrnl.exe"))) { Fail("Образ развёрнут не полностью", "В развёрнутой копии нет системных файлов Windows. Сними клон заново."); return; }
             Set("apply", "ok", Fmt.Size(ImageBytes));
 
-            // ---- Kaspersky Virus Removal Tool: лечит развёрнутую копию, пока она ни разу не запускалась (вирус в ней ещё ничего не сделал)
-            Set("kvrt", "run"); Activity = "Kaspersky ищет и вычищает вирусы в клоне"; ActivityDetail = "свежая утилита с сайта Kaspersky"; StageFraction = -1;
-            string knote;
-            R.SkipRequested = false; R.SkipLabel = "Пропустить проверку";
-            Func<bool> stopK = () => R.Cancelled || R.SkipRequested;
-            string kexe = Kvrt.Get(Path.Combine(Root, "tools"), s => ActivityDetail = s, stopK, out knote);
-            if (R.Cancelled) { R.SkipLabel = null; return; }
-            if (R.SkipRequested) SkipNote("kvrt", "Kaspersky");
-            else if (kexe == null) Set("kvrt", "warn", "Kaspersky недоступен: " + (knote != "" ? knote : "нет интернета") + " — клон проверит только сама программа");
-            else
-            {
-                var kr = Kvrt.Scan(kexe, new[] { target }, Path.Combine(Logs, "kaspersky-" + Stamp), 3, s => ActivityDetail = s, stopK);
-                if (R.Cancelled) { R.SkipLabel = null; return; }
-                if (R.SkipRequested) SkipNote("kvrt", "Kaspersky");
-                else if (!kr.Ran) Set("kvrt", "warn", "проверка не выполнена: " + kr.Note);
-                else
-                {
-                    var finds = kr.Detections.Where(d => !Regex.IsMatch(d, @"\b0\s+(detected|обнаружено|threats)", RegexOptions.IgnoreCase)).Distinct().ToList();
-                    Set("kvrt", kr.Quarantined > 0 || finds.Count > 0 ? "warn" : "ok",
-                        kr.Quarantined > 0 ? "вычищено объектов: " + kr.Quarantined + " (копии — в карантине на диске переноса)" : finds.Count > 0 ? "есть находки — смотри отчёт" : "вирусов не найдено" + (kr.Note != "" ? " · " + kr.Note : ""));
-                    if (kr.Quarantined > 0 || finds.Count > 0)
-                    {
-                        var p = new Problem { Key = "kvrt", Title = "Kaspersky нашёл и вычистил вирусы в клоне", Severity = 2, Count = Math.Max(kr.Quarantined, finds.Count),
-                            Explain = "Найденное вылечено или удалено до первого запуска клона.", Action = "Отчёт и карантин: " + kr.ReportDir + ". Исходный компьютер, с которого снимался клон, тоже заражён — вылечи его и смени пароли." };
-                        foreach (var d in finds.Take(20)) p.Samples.Add(d);
-                        Problems.Add(p);
-                    }
-                    Summary.Add("Kaspersky: " + (kr.Quarantined > 0 ? "вычищено объектов " + kr.Quarantined : finds.Count > 0 ? "есть находки" : "чисто") + ". Отчёт: " + kr.ReportDir);
-                }
-            }
+            // ---- Sentinel: ищет вирусы в развёрнутой копии, пока она ни разу не запускалась (вирус в ней ещё ничего не сделал)
+            if (!SentinelClone("sentinel", target)) return;
+            if (R.Cancelled) return;
 
             // ---- своя проверка: майнеры и следы, которые антивирусы пропускают (исключения Защитника, поддельные имена, задачи с кодом из интернета)
             Activity = "Проверяю клон на майнеры и следы вирусов"; ActivityDetail = "до первого запуска клона";
@@ -593,7 +701,7 @@ namespace Transfer
                 }
                 else
                 {
-                    Activity = "Удаляю найденное из клона"; ActivityDetail = "";
+                    Activity = "Убираю найденное из клона в карантин"; ActivityDetail = Quarantine.Dir(Root, Stamp);
                     int n = Disarm(target);
                     Activity = "Проверяю клон ещё раз";
                     RunSecurityScan("scan", target, false, "Повторная проверка клона после удаления найденного");
@@ -602,12 +710,12 @@ namespace Transfer
                     var still = Sec.Items.Where(t => t.Level >= 2 && t.File != "" && File.Exists(t.File)).ToList();
                     if (still.Count > 0)
                     {
-                        Fail("В клоне остались вирусы", "Удалено файлов: " + n + ", но опасное осталось: " + string.Join("; ", still.Take(3).Select(t => t.What + " " + t.Path)) +
+                        Fail("В клоне остались вирусы", "Убрано в карантин файлов: " + n + ", но опасное осталось: " + string.Join("; ", still.Take(3).Select(t => t.What + " " + t.Path)) +
                              ". Загрузчик не записан — клон не запустится. Основная Windows не тронута. Отчёт: " + SecReportPath);
                         return;
                     }
-                    Set("scan", "warn", "найдено опасного: " + before + ", удалено файлов: " + n + (Sec.Dangerous > 0 ? "; в клоне остались исключения Защитника — убери их после первого запуска" : ""));
-                    Summary.Add("Проверка на майнеры: в клоне было опасного " + before + ", удалено файлов " + n + ". Отчёт: " + SecReportPath);
+                    Set("scan", "warn", "найдено опасного: " + before + ", убрано в карантин файлов: " + n + (Sec.Dangerous > 0 ? "; в клоне остались исключения Защитника — убери их после первого запуска" : ""));
+                    Summary.Add("Проверка на майнеры: в клоне было опасного " + before + ", убрано в карантин файлов " + n + " (" + Quarantine.Dir(Root, Stamp) + "). Отчёт: " + SecReportPath);
                 }
             }
             else

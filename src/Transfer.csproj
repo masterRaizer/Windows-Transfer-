@@ -30,7 +30,7 @@
     <Page Include="MainWindow.xaml"><Generator>MSBuild:Compile</Generator></Page>
     <Compile Include="App.xaml.cs"><DependentUpon>App.xaml</DependentUpon></Compile>
     <Compile Include="MainWindow.xaml.cs"><DependentUpon>MainWindow.xaml</DependentUpon></Compile>
-    <Compile Include="Util.cs" /><Compile Include="Errors.cs" /><Compile Include="Engine.cs" /><Compile Include="Flows.cs" /><Compile Include="Clone.cs" /><Compile Include="Images.cs" /><Compile Include="Hardware.cs" /><Compile Include="Security.cs" /><Compile Include="Kvrt.cs" />
+    <Compile Include="Util.cs" /><Compile Include="Errors.cs" /><Compile Include="Engine.cs" /><Compile Include="Flows.cs" /><Compile Include="Clone.cs" /><Compile Include="Images.cs" /><Compile Include="Hardware.cs" /><Compile Include="Security.cs" /><Compile Include="Sentinel.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
     <EmbeddedResource Include="ps\collect.ps1" />
     <None Include="app.manifest" />
