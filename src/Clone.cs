@@ -36,8 +36,7 @@ namespace Transfer
 
         protected CloneFlowBase()
         {
-            R.OnCancel = KillDism;
-            R.OnPause = p => { lock (dgate) Native.Suspend(dism, p); };
+            R.OnCancel = KillDism;      // пауза DISM — через Sh.SetPaused (вместе с DismHost.exe)
         }
 
         /// <summary>Запуск DISM. Проценты приходят в onPercent (0..100).</summary>
@@ -76,7 +75,8 @@ namespace Transfer
             return rc;
         }
 
-        protected void KillDism() { lock (dgate) { try { if (dism != null && !dism.HasExited) dism.Kill(); } catch { } } }
+        /// <summary>Остановить DISM вместе с DismHost.exe: иначе DismHost продолжает держать образ и раздел.</summary>
+        protected void KillDism() { Process p; lock (dgate) p = dism; Native.KillTree(p); }
 
         /// <summary>Понятное объяснение кода ошибки DISM.</summary>
         protected string DismWhy(int rc)

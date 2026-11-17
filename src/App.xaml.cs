@@ -15,7 +15,7 @@ namespace Transfer
             try
             {
                 foreach (var n in Microsoft.Win32.Registry.LocalMachine.GetSubKeyNames())
-                    if (n == "XFERCLONE" || n.StartsWith("XFERW")) Sh.Run("reg.exe", "unload HKLM\\" + n, null, null);
+                    if (n.StartsWith("XFER", StringComparison.OrdinalIgnoreCase)) Sh.Run("reg.exe", "unload HKLM\\" + n, null, null);
             }
             catch { }
             // снимок диска и ссылка на него

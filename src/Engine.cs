@@ -88,23 +88,37 @@ namespace Transfer
             try { return new DriveInfo(Path.GetPathRoot(path)).AvailableFreeSpace; } catch { return -1; }
         }
 
+        /// <summary>
+        /// Пауза: замораживаются все долгие утилиты (robocopy, DISM вместе с DismHost, sfc, Sentinel, Защитник),
+        /// а этапы, которые работают внутри программы, ждут в <see cref="WaitWhilePaused"/>.
+        /// </summary>
         public void Pause(bool pause)
         {
             Paused = pause;
-            lock (gate) Native.Suspend(current, pause);
-            if (OnPause != null) OnPause(pause);
+            Sh.SetPaused(pause);
+            Log.Write(pause ? "пауза" : "продолжение после паузы");
+            if (OnPause != null) { try { OnPause(pause); } catch { } }
+        }
+
+        /// <summary>Ждать, пока пользователь снимет паузу (или отменит перенос).</summary>
+        public void WaitWhilePaused()
+        {
+            while (Paused && !Cancelled) Thread.Sleep(200);
         }
 
         public void Cancel()
         {
             Cancelled = true;
+            Log.Write("отмена пользователем");
+            if (Paused) { Paused = false; Sh.SetPaused(false); }
             if (OnCancel != null) { try { OnCancel(); } catch { } }
-            lock (gate) { try { if (current != null && !current.HasExited) { Native.Suspend(current, false); current.Kill(); } } catch { } }
+            KillCurrent();
         }
 
         void KillCurrent()
         {
-            lock (gate) { try { if (current != null && !current.HasExited) current.Kill(); } catch { } }
+            Process p; lock (gate) p = current;
+            Native.KillTree(p);
         }
 
         public void Run(List<CopyJob> jobs)

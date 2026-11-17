@@ -88,6 +88,60 @@ namespace Transfer
             try { if (p != null && !p.HasExited) { if (suspend) NtSuspendProcess(p.Handle); else NtResumeProcess(p.Handle); } } catch { }
         }
 
+        // ---- дерево процессов: DISM работает через дочерний DismHost.exe, Sentinel и MpCmdRun тоже могут запускать дочерние процессы
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        struct ProcessEntry32
+        {
+            public uint dwSize, cntUsage, th32ProcessID; public IntPtr th32DefaultHeapID; public uint th32ModuleID, cntThreads, th32ParentProcessID;
+            public int pcPriClassBase; public uint dwFlags; [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string szExeFile;
+        }
+        [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr CreateToolhelp32Snapshot(uint flags, uint pid);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern bool Process32FirstW(IntPtr snap, ref ProcessEntry32 e);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern bool Process32NextW(IntPtr snap, ref ProcessEntry32 e);
+        [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+
+        /// <summary>Все потомки процесса (дети, внуки…), без него самого.</summary>
+        public static List<int> Descendants(int root)
+        {
+            var parent = new Dictionary<int, int>();
+            IntPtr snap = CreateToolhelp32Snapshot(0x2 /*TH32CS_SNAPPROCESS*/, 0);
+            if (snap == IntPtr.Zero || snap == new IntPtr(-1)) return new List<int>();
+            try
+            {
+                var e = new ProcessEntry32 { dwSize = (uint)Marshal.SizeOf(typeof(ProcessEntry32)) };
+                if (Process32FirstW(snap, ref e))
+                    do { parent[(int)e.th32ProcessID] = (int)e.th32ParentProcessID; } while (Process32NextW(snap, ref e));
+            }
+            catch { }
+            finally { CloseHandle(snap); }
+            var result = new List<int>(); var queue = new Queue<int>(); queue.Enqueue(root);
+            while (queue.Count > 0 && result.Count < 500)
+            {
+                int cur = queue.Dequeue();
+                foreach (var kv in parent)
+                    if (kv.Value == cur && kv.Key != cur && kv.Key != root && !result.Contains(kv.Key)) { result.Add(kv.Key); queue.Enqueue(kv.Key); }
+            }
+            return result;
+        }
+
+        /// <summary>Заморозить или разморозить процесс вместе со всеми его потомками.</summary>
+        public static void SuspendTree(Process p, bool suspend)
+        {
+            if (p == null) return;
+            List<int> kids; try { if (p.HasExited) return; kids = Descendants(p.Id); } catch { return; }
+            Suspend(p, suspend);
+            foreach (int id in kids) { try { using (var c = Process.GetProcessById(id)) Suspend(c, suspend); } catch { } }
+        }
+
+        /// <summary>Завершить процесс вместе со всеми его потомками (копии, которые он запустил, иначе продолжили бы работу).</summary>
+        public static void KillTree(Process p)
+        {
+            if (p == null) return;
+            List<int> kids; try { if (p.HasExited) return; kids = Descendants(p.Id); } catch { return; }
+            try { NtResumeProcess(p.Handle); p.Kill(); } catch { }
+            foreach (int id in kids) { try { using (var c = Process.GetProcessById(id)) { NtResumeProcess(c.Handle); c.Kill(); } } catch { } }
+        }
+
         public static void RoundCorners(IntPtr hwnd)
         {
             try { int v = 2; DwmSetWindowAttribute(hwnd, 33, ref v, 4); int dark = 1; DwmSetWindowAttribute(hwnd, 20, ref dark, 4); } catch { }
@@ -102,8 +156,28 @@ namespace Transfer
             get { try { return Encoding.GetEncoding(Native.GetOEMCP()); } catch { return Encoding.Default; } }
         }
 
-        public static int Run(string exe, string args, Action<string> onLine, Encoding enc, Action<Process> started = null)
+        // Долгие утилиты, которые замораживаются кнопкой «Пауза». Короткие служебные (reg, powershell с разметкой диска,
+        // bcdedit) не трогаем: замороженная посреди изменения раздела команда хуже, чем несколько секунд работы.
+        static readonly HashSet<string> Pausable = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "robocopy.exe", "dism.exe", "sfc.exe", "MpCmdRun.exe", "Sentinel.Cli.exe" };
+        static readonly List<Process> Active = new List<Process>();
+        static volatile bool paused;
+
+        /// <summary>Пауза всех долгих утилит. Пока пауза, новые долгие утилиты не запускаются.</summary>
+        public static void SetPaused(bool pause)
         {
+            paused = pause;
+            Process[] list; lock (Active) list = Active.ToArray();
+            foreach (var p in list) Native.SuspendTree(p, pause);
+        }
+
+        /// <summary>
+        /// Запуск программы без окна с построчным чтением вывода. stop — когда вернёт true, программа завершается вместе
+        /// со всеми процессами, которые она запустила (отмена, «Пропустить проверку»). Возвращает код выхода.
+        /// </summary>
+        public static int Run(string exe, string args, Action<string> onLine, Encoding enc, Action<Process> started = null, Func<bool> stop = null)
+        {
+            bool pausable = Pausable.Contains(Path.GetFileName(exe));
+            while (pausable && paused && (stop == null || !stop())) System.Threading.Thread.Sleep(200);
             var psi = new ProcessStartInfo(exe, args)
             {
                 UseShellExecute = false, CreateNoWindow = true,
@@ -112,13 +186,21 @@ namespace Transfer
             };
             using (var p = new Process { StartInfo = psi })
             {
-                p.OutputDataReceived += (s, e) => { if (e.Data != null && onLine != null) onLine(e.Data); };
-                p.ErrorDataReceived += (s, e) => { if (e.Data != null && onLine != null) onLine(e.Data); };
+                p.OutputDataReceived += (s, e) => { if (e.Data != null && onLine != null) { try { onLine(e.Data); } catch { } } };
+                p.ErrorDataReceived += (s, e) => { if (e.Data != null && onLine != null) { try { onLine(e.Data); } catch { } } };
                 p.Start();
-                if (started != null) started(p);
-                p.BeginOutputReadLine(); p.BeginErrorReadLine();
-                p.WaitForExit();
-                return p.ExitCode;
+                if (pausable) lock (Active) Active.Add(p);
+                try
+                {
+                    if (started != null) started(p);
+                    p.BeginOutputReadLine(); p.BeginErrorReadLine();
+                    bool killed = false;
+                    while (!p.WaitForExit(500))
+                        if (!killed && stop != null && stop()) { killed = true; Log.Write("останавливаю " + Path.GetFileName(exe) + " вместе с дочерними процессами"); Native.KillTree(p); }
+                    p.WaitForExit();     // дочитать вывод до конца
+                    return p.ExitCode;
+                }
+                finally { if (pausable) lock (Active) Active.Remove(p); }
             }
         }
 
