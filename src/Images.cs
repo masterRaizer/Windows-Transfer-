@@ -253,26 +253,45 @@ namespace Transfer
                     }
                 }) { IsBackground = true };
                 pump.Start();
-                try
+                // Копирование с докачкой: если диск переноса отвалился, ждём его и продолжаем с того же места (буква могла смениться).
+                long pos = 0; int drops = 0;
+                var buf = new byte[4 << 20];
+                while (true)
                 {
-                    var buf = new byte[4 << 20];
-                    using (var i = new FileStream(src, FileMode.Open, FileAccess.Read, FileShare.Read, 4 << 20, FileOptions.SequentialScan))
-                    using (var o = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None, 4 << 20))
+                    dst = Path.Combine(ImageLib.TemplatesDir(Root), name); tmp = dst + ".part";
+                    try
                     {
-                        int n; R.CurrentFile = dst;
-                        while ((n = i.Read(buf, 0, buf.Length)) > 0)
+                        using (var i = new FileStream(src, FileMode.Open, FileAccess.Read, FileShare.Read, 4 << 20, FileOptions.SequentialScan))
+                        using (var o = new FileStream(tmp, pos == 0 ? FileMode.Create : FileMode.Open, FileAccess.Write, FileShare.None, 4 << 20))
                         {
-                            while (R.Paused && !R.Cancelled) Thread.Sleep(200);
-                            if (R.Cancelled) break;
-                            o.Write(buf, 0, n); Interlocked.Add(ref R.BytesDone, n);
+                            if (pos > 0) { pos = Math.Min(pos, o.Length); o.SetLength(pos); o.Seek(pos, SeekOrigin.Begin); i.Seek(pos, SeekOrigin.Begin); Interlocked.Exchange(ref R.BytesDone, pos); }
+                            int n; R.CurrentFile = dst;
+                            while ((n = i.Read(buf, 0, buf.Length)) > 0)
+                            {
+                                R.WaitWhilePaused();
+                                if (R.Cancelled) break;
+                                o.Write(buf, 0, n); pos += n; Interlocked.Add(ref R.BytesDone, n);
+                            }
                         }
+                        break;
                     }
-                }
-                catch (IOException ex)
-                {
-                    running = false; Copying = false; try { File.Delete(tmp); } catch { }
-                    Fail("Копирование прервалось", "Windows сообщила: " + ex.Message + " Если съёмный диск отключался — подключи его и добавь шаблон ещё раз.");
-                    return;
+                    catch (IOException ex)
+                    {
+                        if (!R.Cancelled) Thread.Sleep(2000);      // Windows не сразу замечает, что диск пропал
+                        if (!R.DeviceOk() && drops < 5 && !R.Cancelled)
+                        {
+                            drops++; Log.Write("шаблон: диск переноса отключился на " + Fmt.Size(pos) + " — жду (" + ex.Message + ")");
+                            Copying = false; R.WaitingDevice = true; Activity = "Жду диск переноса"; R.WaitDevice(); R.WaitingDevice = false; Copying = true;
+                            Activity = "Копирую образ на диск переноса";
+                            if (R.Cancelled) break;
+                            try { pos = File.Exists(Path.Combine(ImageLib.TemplatesDir(Root), name) + ".part") ? Math.Min(pos, new FileInfo(Path.Combine(ImageLib.TemplatesDir(Root), name) + ".part").Length) : 0; } catch { pos = 0; }
+                            pos -= pos % (4 << 20);      // последний блок мог записаться не целиком — повторяем его
+                            continue;
+                        }
+                        running = false; Copying = false; try { File.Delete(tmp); } catch { }
+                        Fail("Копирование прервалось", "Windows сообщила: " + ex.Message + " Если съёмный диск отключался — подключи его и добавь шаблон ещё раз.");
+                        return;
+                    }
                 }
                 running = false; pump.Join(); Copying = false; R.Speed = 0;
                 if (R.Cancelled) { try { File.Delete(tmp); } catch { } return; }
