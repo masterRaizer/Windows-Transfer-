@@ -25,6 +25,10 @@ namespace Transfer
         protected string lastDismLines = "";
         protected volatile string DismLine = "";    // последняя строка DISM (не проценты)
         static readonly Regex OfN = new Regex(@"(\d+)\s+of\s+(\d+)", RegexOptions.Compiled);
+        static readonly Regex OfNItem = new Regex(@"\d+\s+of\s+\d+\s*-\s*(.+?\.inf)\b", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+        protected long DismOfA, DismOfB;            // последнее «N of M» из вывода DISM
+        protected volatile string DismItem = "";    // что DISM обрабатывает сейчас (драйвер)
+        protected volatile bool customStage;        // прогресс этапа показывает свой поток — Dism() его не трогает
 
         /// <summary>Сколько байт запущенный DISM прочитал и записал (-1 — DISM не запущен).</summary>
         protected void DismIo(out long read, out long written)
@@ -46,6 +50,7 @@ namespace Transfer
             string scratch = Path.Combine(Path.GetTempPath(), "Perenos", "scratch");
             Directory.CreateDirectory(scratch);
             DismLine = ""; int loggedPct = -1;
+            if (!customStage) StageEta = double.NaN;
             Log.Write("dism " + args);
             int rc = Sh.Run("dism.exe", "/English " + args + " /ScratchDir:\"" + scratch + "\"", line =>
             {
@@ -62,11 +67,14 @@ namespace Transfer
                 lock (tail) { tail.Enqueue(t); while (tail.Count > 6) tail.Dequeue(); }
                 // Строку DISM видно на экране: «Exporting 12 of 597 …», «Applying image» и т. п.
                 DismLine = t;
-                if (!Copying)
+                var nm = OfN.Match(t); long a, b;
+                bool ofn = nm.Success && long.TryParse(nm.Groups[1].Value, out a) && long.TryParse(nm.Groups[2].Value, out b) && b > 0;
+                if (ofn) { Interlocked.Exchange(ref DismOfA, long.Parse(nm.Groups[1].Value)); Interlocked.Exchange(ref DismOfB, long.Parse(nm.Groups[2].Value)); }
+                var ni = OfNItem.Match(t); if (ni.Success) DismItem = Path.GetFileName(ni.Groups[1].Value.Trim());
+                if (!Copying && !customStage)
                 {
                     ActivityDetail = t.Length > 140 ? t.Substring(0, 140) + "…" : t;
-                    var nm = OfN.Match(t); long a, b;
-                    if (nm.Success && long.TryParse(nm.Groups[1].Value, out a) && long.TryParse(nm.Groups[2].Value, out b) && b > 0) { StageFraction = Math.Min(1, (double)a / b); StageStat = a + " из " + b; }
+                    if (ofn) { long ca = Interlocked.Read(ref DismOfA), cb = Interlocked.Read(ref DismOfB); StageFraction = Math.Min(1, (double)ca / cb); StageStat = ca + " из " + cb; }
                 }
             }, Sh.Oem, p => { lock (dgate) dism = p; });
             lock (dgate) dism = null;
@@ -90,8 +98,130 @@ namespace Transfer
                 case 2: case 3: case 0x80070002: case 0x80070003: return "файл или папка не найдены (диск отключался?)";
                 case 0xC1420127: return "образ уже открыт другой программой — перезагрузи компьютер и повтори";
                 case 1223: case 0x800704C7: return "операция отменена";
+                case 433: case 0x800701B1: case 1167: case 0x8007048F: case 21: case 0x80070015: case 31: case 0x8007001F: case 121: case 0x80070079: case 1006: case 0x800703EE:
+                    return "съёмный диск отключился или перестал отвечать во время работы (код 0x" + unchecked((uint)rc).ToString("X8") + ") — проверь кабель и разъём, лучше подключить диск напрямую к корпусу, без хаба";
                 default: return "DISM сообщил: " + (lastDismLines.Length > 220 ? lastDismLines.Substring(lastDismLines.Length - 220) : lastDismLines) + " (код " + rc + ")";
             }
+        }
+
+        /// <summary>Код DISM означает, что пропал или перестал отвечать диск (обычно — съёмный диск переноса).</summary>
+        protected static bool IsDeviceError(int rc)
+        {
+            switch (unchecked((uint)rc))
+            {
+                case 433: case 0x800701B1: case 1167: case 0x8007048F: case 21: case 0x80070015: case 31: case 0x8007001F: case 121: case 0x80070079: case 1006: case 0x800703EE:
+                case 0x8007045D: case 1117: return true;
+                default: return false;
+            }
+        }
+
+        /// <summary>Диск переноса пропал: ждать, пока вернётся (может вернуться под другой буквой). false — пользователь отменил.</summary>
+        protected bool WaitForDevice(string why)
+        {
+            Log.Write("диск переноса недоступен (" + why + ") — жду");
+            string act = Activity;
+            R.WaitingDevice = true; Activity = "Жду диск переноса";
+            R.WaitDevice();
+            R.WaitingDevice = false; Activity = act;
+            if (R.Cancelled) return false;
+            Thread.Sleep(3000);     // дать диску «осесть» после повторного подключения
+            Log.Write("диск переноса снова доступен: " + Root);
+            return !R.Cancelled;
+        }
+
+        /// <summary>
+        /// DISM, которому нужен диск переноса (чтение образа, драйверов): если диск отвалился посреди работы, ждём его и повторяем (до трёх попыток).
+        /// args пересчитывается на каждой попытке — диск мог вернуться под другой буквой.
+        /// </summary>
+        protected int DismRetry(string what, Func<string> args, Action<double> onPercent)
+        {
+            for (int attempt = 1; ; attempt++)
+            {
+                int rc = Dism(args(), onPercent);
+                if (R.Cancelled) return rc;
+                bool lost = !R.DeviceOk() || IsDeviceError(rc);
+                if (!lost || attempt >= 3) return rc;
+                Log.Write(what + ": обрыв диска (код " + rc + "), попытка " + attempt + " из 3");
+                if (!WaitForDevice(what)) return rc;
+            }
+        }
+
+        /// <summary>
+        /// Добавить драйверы в развёрнутую копию с понятным прогрессом «драйвер N из M». DISM печатает строку только после каждого драйвера,
+        /// а тяжёлые пакеты (видео, звук) ставятся по несколько минут — поэтому счётчик дополнительно берётся из C:\Windows\Logs\DISM\dism.log,
+        /// а на экране видно, какой драйвер ставится сейчас и сколько уже идёт.
+        /// </summary>
+        protected int AddDrivers(string target, Func<string> driversDir, out int doneCount, out int totalCount)
+        {
+            int total = 0;
+            try { total = Directory.GetFiles(driversDir(), "*.inf", SearchOption.AllDirectories).Length; } catch { }
+            string dlog = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), @"Logs\DISM\dism.log");
+            long offset = 0; try { offset = new FileInfo(dlog).Length; } catch { }
+            var clock = new StageClock(R); int logDone = 0; string curInf = ""; DateTime curSince = DateTime.Now, nextLog = DateTime.Now.AddMinutes(1);
+            // одна строка на драйвер: «Successfully proccessed driver package» (так, с опечаткой, пишет DISM) или «Failed to process driver package»
+            var success = new Regex(@"success\w*\s+proc+es+ed\s+(the\s+)?driver\s+package|fail\w*\s+to\s+proc+ess\s+(the\s+)?driver\s+package", RegexOptions.IgnoreCase);
+            var infRx = new Regex(@"([^\\/\s""']+?\.inf)(?=[_\\/\s""':,]|$)", RegexOptions.IgnoreCase);
+            bool running = true, utf16 = false;
+            try { using (var fs = new FileStream(dlog, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete)) { int b0 = fs.ReadByte(), b1 = fs.ReadByte(); utf16 = b0 == 0xFF && b1 == 0xFE; } } catch { }
+            if (utf16 && offset % 2 == 1) offset--;
+            customStage = true; Interlocked.Exchange(ref DismOfA, 0); Interlocked.Exchange(ref DismOfB, 0); DismItem = "";
+            Activity = "Добавляю в клон драйверы этого компьютера"; StageFraction = total > 0 ? 0 : -1; StageStat = total > 0 ? "драйвер 0 из " + total : ""; StageEta = double.NaN;
+            var watch = new Thread(() =>
+            {
+                string tail = "";
+                while (running)
+                {
+                    Thread.Sleep(1000);
+                    try
+                    {
+                        using (var fs = new FileStream(dlog, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                        {
+                            if (fs.Length < offset) { offset = 0; tail = ""; }            // журнал DISM переименован в .bak и начат заново
+                            long len = Math.Min(fs.Length - offset, 8L << 20);
+                            if (len > 0)
+                            {
+                                fs.Seek(offset, SeekOrigin.Begin);
+                                var buf = new byte[len]; int got = fs.Read(buf, 0, buf.Length); offset += got;
+                                string text = tail + (utf16 ? Encoding.Unicode.GetString(buf, 0, got - got % 2) : Encoding.Default.GetString(buf, 0, got));
+                                if (utf16 && got % 2 == 1) offset--;
+                                int cut = text.LastIndexOf('\n'); tail = cut < 0 ? text : text.Substring(cut + 1); if (cut < 0) text = ""; else text = text.Substring(0, cut);
+                                foreach (var line in text.Split('\n'))
+                                {
+                                    if (line.IndexOf("driver", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                                    if (success.IsMatch(line)) logDone++;
+                                    else if (Regex.IsMatch(line, @"(install|process|add|import)\w*\s+(the\s+)?driver\s+package", RegexOptions.IgnoreCase))
+                                    { var mi = infRx.Match(line); if (mi.Success && !string.Equals(mi.Groups[1].Value, curInf, StringComparison.OrdinalIgnoreCase)) { curInf = mi.Groups[1].Value; curSince = DateTime.Now; } }
+                                }
+                            }
+                        }
+                    }
+                    catch { }
+                    long ca = Interlocked.Read(ref DismOfA), cb = Interlocked.Read(ref DismOfB);
+                    int all = cb > 0 ? (int)cb : total;
+                    int done = (int)Math.Max(ca > 0 ? ca - 1 : 0, logDone);        // «Installing 5 of 9» — пятый ещё ставится
+                    if (all > 0) done = Math.Min(done, all);
+                    string item = DismItem; if (item != "" && !string.Equals(item, curInf, StringComparison.OrdinalIgnoreCase)) { curInf = item; curSince = DateTime.Now; }
+                    if (all > 0)
+                    {
+                        double fr = Math.Min(0.999, (double)done / all);
+                        StageFraction = fr; StageEta = clock.Update(fr);
+                        StageStat = "драйвер " + done + " из " + all;
+                    }
+                    double sec = (DateTime.Now - curSince).TotalSeconds;
+                    ActivityDetail = curInf == "" ? "DISM ищет драйверы в папке" :
+                        "сейчас: " + curInf + " · " + Fmt.Clock(DateTime.Now - curSince) + (sec > 60 ? " — большие драйверы (видео, звук) ставятся по несколько минут, это нормально" : "");
+                    if (DateTime.Now >= nextLog) { nextLog = DateTime.Now.AddMinutes(1); Log.Write("драйверы: " + done + " из " + all + ", сейчас " + curInf + ", осталось " + Fmt.Eta(StageEta)); }
+                }
+            }) { IsBackground = true };
+            watch.Start();
+            int rc;
+            try { rc = DismRetry("добавление драйверов", () => "/Image:" + target + " /Add-Driver /Driver:\"" + driversDir() + "\" /Recurse", null); }
+            finally { running = false; watch.Join(3000); customStage = false; }
+            long fa = Interlocked.Read(ref DismOfA), fb = Interlocked.Read(ref DismOfB);
+            totalCount = fb > 0 ? (int)fb : total;
+            doneCount = rc == 0 ? totalCount : (int)Math.Max(fa, logDone);
+            ResetStage();
+            return rc;
         }
 
         /// <summary>Плавный прогресс и скорость для экрана: доля берётся из процентов DISM.</summary>
@@ -450,10 +580,10 @@ namespace Transfer
                         pct => { if (!Copying) { Copying = true; Activity = "Снимаю образ Windows"; } Interlocked.Exchange(ref R.BytesDone, (long)(used * pct / 100.0)); });
                     running = false; pump.Join(); Copying = false;
                     if (R.Cancelled) { try { File.Delete(Wim); } catch { } return; }
-                    if (lost || !R.DeviceOk())
+                    if (lost || !R.DeviceOk() || IsDeviceError(rc))
                     {
                         if (attempt >= 3) { Fail("Диск переноса отключается снова и снова", "Образ не удалось записать с трёх попыток: съёмный диск пропадает во время записи. Замени кабель или подключи диск в другой разъём на корпусе и запусти клонирование заново."); return; }
-                        R.WaitingDevice = true; Activity = "Жду диск переноса"; R.WaitDevice(); R.WaitingDevice = false;
+                        if (!WaitForDevice("снятие образа")) { try { File.Delete(Wim); } catch { } return; }
                         continue;      // файл образа нельзя дописать с середины — начинаем заново
                     }
                     if (rc != 0) { Fail("Не удалось снять образ Windows", "Причина: " + DismWhy(rc) + "."); try { File.Delete(Wim); } catch { } return; }
@@ -563,7 +693,14 @@ namespace Transfer
                 // ---- драйверы этого компьютера (в первую очередь контроллер диска): без них клон не увидит диск и не загрузится
                 Set("drv", "run"); Activity = "Сохраняю драйверы этого компьютера"; ActivityDetail = "их получит клон, чтобы увидеть диск, Wi-Fi и экран";
                 Directory.CreateDirectory(drivers);
-                int drc = Dism("/Online /Export-Driver /Destination:\"" + drivers + "\"", null);
+                int drc = DismRetry("сохранение драйверов", () =>
+                {
+                    drivers = Path.Combine(Root, "images", "drivers-" + Environment.MachineName);   // диск мог вернуться под другой буквой
+                    Directory.CreateDirectory(drivers);
+                    return "/Online /Export-Driver /Destination:\"" + drivers + "\"";
+                }, null);
+                ResetStage();
+                if (R.Cancelled) return;
                 int ndrv = 0; try { ndrv = Directory.GetDirectories(drivers).Length; } catch { }
                 Set("drv", ndrv > 0 ? "ok" : "warn", ndrv > 0 ? "сохранено драйверов: " + ndrv : "драйверы сохранить не удалось — клон может не увидеть диск");
                 if (R.Cancelled) return;
@@ -667,10 +804,11 @@ namespace Transfer
                     });
                 running = false; pump.Join(); Copying = false;
                 if (R.Cancelled) return;
-                if (lost || !R.DeviceOk())
+                if (lost || !R.DeviceOk() || IsDeviceError(rc))
                 {
+                    Log.Write("разворачивание прервано: диск недоступен (код " + rc + "), попытка " + attempt + " из 3");
                     if (attempt >= 3) { Fail("Диск переноса отключается снова и снова", "Развернуть образ не удалось с трёх попыток. Замени кабель или разъём и запусти снова. Текущая Windows не тронута и работает."); return; }
-                    R.WaitingDevice = true; Activity = "Жду диск переноса"; R.WaitDevice(); R.WaitingDevice = false;
+                    if (!WaitForDevice("разворачивание образа")) return;
                     Activity = "Разворачиваю Windows заново"; Ps("Format-Volume -DriveLetter " + target.Substring(0, 1) + " -FileSystem NTFS -NewFileSystemLabel 'Windows 2' -Confirm:$false | Out-Null;'OK'");
                     continue;
                 }
@@ -727,22 +865,25 @@ namespace Transfer
             // ---- сверка системных файлов клона: подменённые или повреждённые файлы Windows восстанавливаются из хранилища самого клона
             Set("sfc", "run"); Activity = "Сверяю системные файлы клона с оригиналами Windows"; ActivityDetail = "подменённые файлы будут восстановлены"; StageFraction = 0;
             {
-                var sb = new StringBuilder(); Process sfcProc = null;
+                var sb = new StringBuilder();
                 var sfcPct = new Regex(@"(\d{1,3})\s*%");
-                bool sfcDone = false;
-                var sfcStop = new Thread(() => { while (!sfcDone) { Thread.Sleep(1000); if (R.Cancelled) { try { if (sfcProc != null) sfcProc.Kill(); } catch { } return; } } }) { IsBackground = true };
-                sfcStop.Start();
+                var sfcClock = new StageClock(R); var sfcStart = DateTime.Now;
                 int src = Sh.Run("sfc.exe", "/scannow /offbootdir=" + target.Substring(0, 3) + " /offwindir=" + Path.Combine(target, "Windows"), l =>
                 {
                     if (string.IsNullOrWhiteSpace(l)) return;
                     string t = l.Replace("\0", "").Trim(); if (t == "") return;
-                    var m = sfcPct.Match(t); if (m.Success) { StageFraction = Math.Min(1, int.Parse(m.Groups[1].Value) / 100.0); StageStat = m.Groups[1].Value + "%"; return; }
+                    var m = sfcPct.Match(t);
+                    if (m.Success)
+                    {
+                        double fr = Math.Min(1, int.Parse(m.Groups[1].Value) / 100.0);
+                        StageFraction = fr; StageEta = sfcClock.Update(fr); StageStat = m.Groups[1].Value + "% · идёт " + Fmt.Clock(DateTime.Now - sfcStart);
+                        return;
+                    }
                     lock (sb) sb.AppendLine(t); ActivityDetail = t.Length > 140 ? t.Substring(0, 140) + "…" : t;
-                }, Encoding.Unicode, p => sfcProc = p);
-                sfcDone = true;
+                }, Encoding.Unicode, null, StopCheck(false));
+                ResetStage();
                 if (R.Cancelled) return;
                 string so = sb.ToString(); Log.Write("sfc -> " + src + " | " + (so.Length > 600 ? so.Substring(so.Length - 600) : so));
-                StageFraction = -1; StageStat = "";
                 if (Regex.IsMatch(so, "не обнаружила нарушений|did not find any integrity violations", RegexOptions.IgnoreCase)) Set("sfc", "ok", "системные файлы совпадают с оригиналами");
                 else if (Regex.IsMatch(so, "успешно их восстановила|successfully repaired", RegexOptions.IgnoreCase))
                 {
@@ -764,9 +905,11 @@ namespace Transfer
             if (!test && Directory.Exists(drivers) && Directory.GetDirectories(drivers).Length > 0)
             {
                 ActivityDetail = "драйверы этого компьютера";
-                int arc = Dism("/Image:" + target + " /Add-Driver /Driver:\"" + drivers + "\" /Recurse", null);
-                var mi = Regex.Match(lastDismLines, @"(\d+)\s+of\s+(\d+)");
-                fixNote = arc == 0 ? "драйверы добавлены" : "часть драйверов не добавилась (" + DismWhy(arc) + ")";
+                int dDone, dTotal;
+                int arc = AddDrivers(target, () => Path.Combine(Root, "images", "drivers-" + Environment.MachineName), out dDone, out dTotal);
+                if (R.Cancelled) return;
+                fixNote = arc == 0 ? "драйверы добавлены" + (dTotal > 0 ? ": " + dTotal : "") : "часть драйверов не добавилась (" + DismWhy(arc) + ")" + (dTotal > 0 ? ", обработано " + dDone + " из " + dTotal : "");
+                Activity = "Настраиваю клон";
             }
             // Буквы дисков в клоне записаны под старый компьютер: без очистки новая Windows может получить не «C:» и не загрузиться.
             ActivityDetail = "буквы дисков";

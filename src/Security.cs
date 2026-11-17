@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -227,8 +227,9 @@ namespace Transfer
                 if (m.Success) { threat = m.Groups[1].Value.Trim(); found.Add(threat); return; }
                 var f = Regex.Match(t, @"^(file|regkey|process|service)\s*:\s*(.+)$", RegexOptions.IgnoreCase);
                 if (f.Success && threat != null) c.Add(2, "Защитник Windows нашёл: " + threat, f.Groups[2].Value.Trim(), "угроза из базы Защитника");
-            }, Sh.Oem);
+            }, Sh.Oem, null, c.Cancelled);      // отмена и «Пропустить проверку» останавливают и Защитника
             Log.Write("security: MpCmdRun " + args + " -> " + rc);
+            if (c.Cancelled()) return;
             if (rc == 2 && found.Count == 0) c.Add(2, "Защитник Windows нашёл угрозы", "", "подробности — в журнале защиты Windows");
             foreach (var t in found.Distinct()) if (!c.Rep.Items.Any(x => x.What.EndsWith(t))) c.Add(2, "Защитник Windows нашёл: " + t, "", "угроза из базы Защитника");
         }
