@@ -100,7 +100,7 @@ namespace Transfer
             version = "";
             try
             {
-                using (var s = typeof(SentinelScan).Assembly.GetManifestResourceStream(ResourceName))
+                using (var s = OpenEmbedded())
                 {
                     if (s == null) { Log.Write("sentinel: в эту сборку Sentinel не встроен"); return null; }
                     string id;
@@ -135,6 +135,34 @@ namespace Transfer
                 }
             }
             catch (Exception e) { Log.Write("sentinel: не удалось распаковать встроенный Sentinel — " + e.Message); return null; }
+        }
+
+        /// <summary>
+        /// Встроенный архив: целиком (Transfer.sentinel.zip) или частями Transfer.sentinel.zip.part1, .part2, … — большой релиз Sentinel
+        /// не помещается в один файл репозитория. Части склеиваются во временный файл (удаляется при закрытии потока). null — архива нет.
+        /// </summary>
+        static Stream OpenEmbedded()
+        {
+            var asm = typeof(SentinelScan).Assembly;
+            var whole = asm.GetManifestResourceStream(ResourceName);
+            if (whole != null) return whole;
+            string prefix = ResourceName + ".part";
+            var parts = asm.GetManifestResourceNames().Where(n => n.StartsWith(prefix, StringComparison.Ordinal))
+                .Select(n => { int k; return new KeyValuePair<int, string>(int.TryParse(n.Substring(prefix.Length), out k) ? k : -1, n); })
+                .Where(kv => kv.Key > 0).OrderBy(kv => kv.Key).ToList();
+            if (parts.Count == 0) return null;
+            for (int i = 0; i < parts.Count; i++) if (parts[i].Key != i + 1) { Log.Write("sentinel: не хватает части " + (i + 1) + " встроенного архива"); return null; }
+            Directory.CreateDirectory(LocalBase);
+            string tmp = Path.Combine(LocalBase, "sentinel-" + Guid.NewGuid().ToString("N") + ".zip");
+            var fs = new FileStream(tmp, FileMode.Create, FileAccess.ReadWrite, FileShare.None, 1 << 20, FileOptions.DeleteOnClose);
+            try
+            {
+                foreach (var kv in parts)
+                    using (var p = asm.GetManifestResourceStream(kv.Value)) p.CopyTo(fs);
+                fs.Position = 0;
+                return fs;
+            }
+            catch { fs.Dispose(); throw; }
         }
 
         /// <summary>

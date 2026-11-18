@@ -23,16 +23,21 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\MSBuild.exe src\Transfer.csproj 
 
 ### Обновить встроенный Sentinel
 
-`src\sentinel\sentinel.zip` — готовая сборка Sentinel для Windows x64 (автономная, .NET на компьютере не нужен):
-`Sentinel.Cli.exe`, `rules\`, `data\threat_hashes.bin`, `allowed_exclusions.json`, `THIRD_PARTY_NOTICES.md`, `sentinel-version.txt`.
-Её пересобирает скрипт (нужны .NET SDK 8 и git; работает на Linux, macOS и Windows с bash):
+`src\sentinel\sentinel.zip` — Sentinel для Windows x64 (автономный, .NET на компьютере не нужен):
+`Sentinel.Cli.exe`, `rules\`, `data\`, `allowed_exclusions.json`, `THIRD_PARTY_NOTICES.md`, `sentinel-version.txt`.
+Берётся из **официального релиза** Antivirus-tool (переносная версия `Sentinel-vX-portable-win-x64.zip`): в релизном
+`Sentinel.Cli.exe` собрана большая база хешей угроз из открытых источников, которую из исходников без ключей не получить.
+Обновляет скрипт (нужны bash, curl, python3; .NET SDK не нужен):
 
 ```
-scripts/update-sentinel.sh            # из ветки main репозитория Antivirus-tool
-scripts/update-sentinel.sh <коммит>   # из конкретной версии
+scripts/update-sentinel.sh            # последний релиз
+scripts/update-sentinel.sh 1.3.11     # конкретный релиз
+scripts/update-sentinel.sh --source main   # сборка из исходников (нужен .NET SDK 8; только стартовая база угроз)
 ```
 
-После этого — обычная сборка MSBuild. Если архива нет, программа всё равно собирается и ищет установленный Sentinel.
+GitHub не принимает файлы больше 100 МБ, поэтому архив больше 90 МБ скрипт режет на части `sentinel.zip.part1`, `.part2`, …;
+MSBuild встраивает все части, а программа склеивает их перед распаковкой. После обновления — обычная сборка MSBuild.
+Если архива нет, программа всё равно собирается и ищет установленный Sentinel.
 
 ### Ограничения кода
 

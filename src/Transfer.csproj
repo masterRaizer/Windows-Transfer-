@@ -34,7 +34,9 @@
     <Compile Include="Properties\AssemblyInfo.cs" />
     <EmbeddedResource Include="ps\collect.ps1" />
     <!-- встроенный антивирус Sentinel (собирается scripts/update-sentinel.sh); без архива программа собирается и ищет установленный Sentinel -->
+    <!-- архив больше 90 МБ лежит частями sentinel.zip.part1, .part2, … (лимит GitHub — 100 МБ на файл); программа склеивает их сама -->
     <EmbeddedResource Include="sentinel\sentinel.zip" Condition="Exists('sentinel\sentinel.zip')"><LogicalName>Transfer.sentinel.zip</LogicalName></EmbeddedResource>
+    <EmbeddedResource Include="sentinel\sentinel.zip.part*"><LogicalName>Transfer.%(Filename)%(Extension)</LogicalName></EmbeddedResource>
     <None Include="app.manifest" />
     <Resource Include="app.ico" />
   </ItemGroup>
