@@ -19,7 +19,8 @@ C:\Windows\Microsoft.NET\Framework64\v4.0.30319\MSBuild.exe src\Transfer.csproj 
 ```
 
 Готовый `src\bin\Transfer.exe` кладётся на диск переноса как `F:\Windows Transfer\Перенос.exe`.
-Антивирус Sentinel встраивается в него автоматически из `src\sentinel\sentinel.zip` (exe получается ≈ 31 МБ).
+Антивирус Sentinel (сейчас — релиз 1.3.11 с полной базой угроз) встраивается в него автоматически из `src\sentinel\sentinel.zip.part*`
+(exe получается ≈ 103 МБ).
 
 ### Обновить встроенный Sentinel
 
@@ -98,7 +99,7 @@ MSBuild встраивает все части, а программа склеи
 
 Раньше клон проверял Kaspersky Virus Removal Tool: его каждый раз скачивали с сайта Kaspersky, он сканировал весь раздел
 (15+ минут на 100 ГБ) и перезапускал себя копией из `%TEMP%`. Теперь используется **Sentinel** — собственный антивирус
-пользователя (репозиторий `masterRaizer/Antivirus-tool`, версия 1.3.x).
+пользователя (репозиторий `masterRaizer/Antivirus-tool`, встроен релиз 1.3.11).
 
 - **Где берётся**: Sentinel **встроен в Перенос.exe** (ресурс `Transfer.sentinel.zip`). При первой проверке он распаковывается в
   `%LOCALAPPDATA%\Perenos\sentinel\<отпечаток>\` (старые версии удаляются) — ничего скачивать и устанавливать не нужно.
