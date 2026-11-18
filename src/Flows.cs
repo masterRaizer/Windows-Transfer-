@@ -25,6 +25,29 @@ namespace Transfer
         void Raise(string n) { var h = PropertyChanged; if (h != null) h(this, new PropertyChangedEventArgs(n)); }
     }
 
+    /// <summary>
+    /// Оставшееся время этапа по доле выполненного: считается по скорости за последние минуты (окно сдвигается),
+    /// паузы не учитываются. Пока данных мало — NaN («считаю…»).
+    /// </summary>
+    class StageClock
+    {
+        readonly Queue<KeyValuePair<DateTime, double>> samples = new Queue<KeyValuePair<DateTime, double>>();
+        readonly Runner r;
+        public StageClock(Runner runner) { r = runner; }
+
+        public double Update(double fraction)
+        {
+            if (r != null && r.Paused) { samples.Clear(); return double.NaN; }
+            var now = DateTime.Now;
+            samples.Enqueue(new KeyValuePair<DateTime, double>(now, fraction));
+            while (samples.Count > 2 && (now - samples.Peek().Key).TotalSeconds > 180) samples.Dequeue();
+            var first = samples.Peek();
+            double sec = (now - first.Key).TotalSeconds, df = fraction - first.Value;
+            if (sec < 15 || df <= 0.002) return double.NaN;
+            return Math.Max(0, (1 - fraction) * sec / df);
+        }
+    }
+
     /// <summary>Общая часть сценариев «сохранить» и «восстановить».</summary>
     abstract class Flow
     {
@@ -38,6 +61,7 @@ namespace Transfer
         public volatile bool Finished;
         public double StageFraction = -1;         // 0..1 для этапов без копирования; -1 — неизвестно
         public string StageStat = "";
+        public double StageEta = double.NaN;      // сколько секунд осталось на этапе без копирования (NaN — неизвестно)
         public string ResultTitle = "", ResultText = "";
         public int ResultLevel;                   // 0 — хорошо, 1 — с замечаниями, 2 — не удалось
         public List<Problem> Problems = new List<Problem>();
@@ -66,6 +90,9 @@ namespace Transfer
         {
             App.Ui(() => { var s = Step(id); if (s == null) return; s.State = state; if (detail != null) s.Detail = detail; });
         }
+
+        /// <summary>Сбросить прогресс этапа без копирования: неизвестная доля, без подписи и без оставшегося времени.</summary>
+        protected void ResetStage() { StageFraction = -1; StageStat = ""; StageEta = double.NaN; }
 
         protected void OkIfRunning(string id) { App.Ui(() => { var s = Step(id); if (s != null && s.State == "run") s.State = "ok"; }); }
 

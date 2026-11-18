@@ -22,7 +22,7 @@
   </PropertyGroup>
   <ItemGroup>
     <Reference Include="System" /><Reference Include="System.Core" /><Reference Include="System.Xaml" />
-    <Reference Include="System.Management" /><Reference Include="System.Xml" /><Reference Include="System.Web.Extensions" />
+    <Reference Include="System.Management" /><Reference Include="System.IO.Compression" /><Reference Include="System.IO.Compression.FileSystem" /><Reference Include="System.Xml" /><Reference Include="System.Web.Extensions" />
     <Reference Include="WindowsBase" /><Reference Include="PresentationCore" /><Reference Include="PresentationFramework" />
   </ItemGroup>
   <ItemGroup>
@@ -30,9 +30,13 @@
     <Page Include="MainWindow.xaml"><Generator>MSBuild:Compile</Generator></Page>
     <Compile Include="App.xaml.cs"><DependentUpon>App.xaml</DependentUpon></Compile>
     <Compile Include="MainWindow.xaml.cs"><DependentUpon>MainWindow.xaml</DependentUpon></Compile>
-    <Compile Include="Util.cs" /><Compile Include="Errors.cs" /><Compile Include="Engine.cs" /><Compile Include="Flows.cs" /><Compile Include="Clone.cs" /><Compile Include="Images.cs" /><Compile Include="Hardware.cs" /><Compile Include="Security.cs" /><Compile Include="Kvrt.cs" />
+    <Compile Include="Util.cs" /><Compile Include="Errors.cs" /><Compile Include="Engine.cs" /><Compile Include="Flows.cs" /><Compile Include="Clone.cs" /><Compile Include="Images.cs" /><Compile Include="Hardware.cs" /><Compile Include="Security.cs" /><Compile Include="Sentinel.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
     <EmbeddedResource Include="ps\collect.ps1" />
+    <!-- встроенный антивирус Sentinel (собирается scripts/update-sentinel.sh); без архива программа собирается и ищет установленный Sentinel -->
+    <!-- архив больше 90 МБ лежит частями sentinel.zip.part1, .part2, … (лимит GitHub — 100 МБ на файл); программа склеивает их сама -->
+    <EmbeddedResource Include="sentinel\sentinel.zip" Condition="Exists('sentinel\sentinel.zip')"><LogicalName>Transfer.sentinel.zip</LogicalName></EmbeddedResource>
+    <EmbeddedResource Include="sentinel\sentinel.zip.part*"><LogicalName>Transfer.%(Filename)%(Extension)</LogicalName></EmbeddedResource>
     <None Include="app.manifest" />
     <Resource Include="app.ico" />
   </ItemGroup>
